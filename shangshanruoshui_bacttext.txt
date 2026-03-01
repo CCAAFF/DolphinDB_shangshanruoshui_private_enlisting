@@ -1,0 +1,602 @@
+
+//// 逻辑思考
+// 基本要求：
+// 就是均线多头排列，均线指的是5天线，20天线和60天均线，回踩20天均线的时候收阳线。然后距离20天均线的在收在20天均线之上，然后距离20天均线不超过10%这样的股票在未来的。买入之后，在未来一周之内的收益情况，如果它涨幅超过40%，平仓一半，如果涨幅超过80%，全部平仓。如果亏损10%也全部平仓啊，然后你统计一下，在过去的3年内，5年内，10年内，这样儿的一个股票的投资策略的一个收益率曲线是怎么样的，成功率是多少，然后再。哪些月份的成功率会更高，哪一些月份的成功率会低一些，然后如果你有其他的优可以优化这个策略的方法，你也可以加入其他的一些指标。把你觉得比较好的一些像成交量啊，我觉得成交量这个指标你可以考虑进去，其他那种技术分析的指标不需要啊。
+
+// 技术条件拆解：
+/*
+买入条件（信号日）：
+均线多头排列：ma5 > ma20 > ma60
+回踩20日均线：收盘价 close 在20日均线 ma20 之上
+不超过10%：距离不超过10%
+收阳线：收盘价 close > 开盘价 open
+成交量确认（优化项）：当日成交量 vol 大于20日均量 ma_v_20
+卖出规则（持仓期内）：
+
+止盈1：涨幅 ≥ 40% → 平仓一半
+止盈2：涨幅 ≥ 80% → 全部平仓
+止损：亏损 ≥ 10% → 全部平仓
+强制平仓：持仓满5个交易日（一周）后强制卖出
+*/
+
+//// 代码处理
+login("admin", "123456")  // 登录DolphinDB系统，用户名admin，密码123456
+trading_days = getMarketCalendar("XSHG", 2017.04.01, 2040.05.10) // 获取上海证券交易所2017.04.01至2040.05.10期间的实际交易日历
+
+dbPath1 = "dfs://基础数据表_表1_不复权"
+tableName1 = "日期"  
+db1 = database(dbPath1)
+不复权买卖交易_库1 = loadTable(db1, tableName1)
+
+dbPath2 = "dfs://表2_前复权_因子指标"
+tableName2 = "日期"  
+db2 = database(dbPath2)
+前复权因子指标_库2 = loadTable(db2, tableName2)
+
+
+// 读取例子
+不复权买卖交易_库1_例 = select top 10000 * from 不复权买卖交易_库1
+前复权因子指标_库2_例 = select top 100000 date, ts_code, ts_name, open_qfq, high_qfq, low_qfq, close_qfq,preClose,成交量万手,成交额亿元,流通股亿元,换手率百分比 from 前复权因子指标_库2
+
+
+
+///////////////////////////////////////////////////////////////
+
+
+def sell_plan_function_1(account_everyday_copy, mutable sell_plan_copy, trading_day){
+
+    // 策略1：持仓满20日的卖出计划。
+    // 从 account_everyday_copy 中筛选出理论持仓天数小于等于0的记录。
+    // 为这些记录创建卖出计划，并设置交易策略为“持仓满20日”。
+    sell_plan_from_account_1 = select 日期, 股票代码, 股票名称, `持仓满20日 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+      市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 from account_everyday_copy where 理论持仓剩余天数<=0
+
+    // 策略2：盈利超过55%的卖出计划。
+    // 从 account_everyday_copy 中筛选出盈亏比例大于等于0.55的记录。
+    // 为这些记录创建卖出计划，并设置交易策略为“高于成本百分之55”。
+    sell_plan_from_account_2 = select 日期, 股票代码, 股票名称, `高于成本百分之55 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+      市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 from account_everyday_copy where 盈亏比例>=0.55
+    
+    // 策略3：亏损超过20%的卖出计划。
+    // 从 account_everyday_copy 中筛选出盈亏比例小于等于-0.2的记录。
+    // 为这些记录创建卖出计划，并设置交易策略为“低于成本百分之20”。
+    sell_plan_from_account_3 = select 日期, 股票代码, 股票名称, `低于成本百分之20 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+      市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 from account_everyday_copy where 盈亏比例<=-0.2
+    
+    // 初始化一个空的临时卖出计划表 'sell_plan_temporary'，定义了该表的列名和数据类型。
+    sell_plan_temporary = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+      [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+    // 将策略123生成的卖出计划追加到临时卖出计划表中。
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_1)
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_2)
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_3)
+    
+    
+    // 从外部数据源加载并筛选当日的因子指标数据，用于后续的卖出策略判断。
+    trading_day_table_2 = select * from loadTable("dfs://表2_前复权_因子指标", `日期) where date == trading_day
+    
+    // 将 account_everyday_copy（持仓账户数据）与 trading_day_table_2（当日因子指标数据）通过股票代码进行左连接。
+    // 筛选出在因子指标表中存在对应数据的股票，用于接下来的策略判断。
+    alignedTable = select * from account_everyday_copy as a left join trading_day_table_2 as b on a.股票代码 = b.ts_code where b.ts_code != NULL
+    
+    // 策略4：触发高9指标的卖出计划。
+    // 从 alignedTable 中筛选出高9指标大于等于9的记录。
+    // 为这些记录创建卖出计划，并设置交易策略为“触发高9”。
+    sell_plan_from_account_4 = select 日期, 股票代码, 股票名称, `触发高9 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+      市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 from alignedTable where 高9>=9
+
+    // 策略5：收盘价低于当日MA55L值的卖出计划。
+    // 从 alignedTable 中筛选出市价（收盘价）小于MA55L的记录。
+    // 为这些记录创建卖出计划，并设置交易策略为“收盘价低于当日MA55L值”。
+    sell_plan_from_account_5 = select 日期, 股票代码, 股票名称, `收盘价低于当日MA55L值 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+      市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 from alignedTable where 市价<MA55L
+    
+    // 将策略45生成的卖出计划追加到临时卖出计划表中。
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_4)
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_5)
+    
+    // 将所有临时的卖出计划与传入的 sell_plan_copy 进行合并。
+    sell_plan_copy = unionAll(sell_plan_temporary, sell_plan_copy)
+    
+    // 按股票代码对合并后的卖出计划进行分组，并为每个股票保留第一条记录。
+    // 这一步确保了对于同一个股票，即使它满足了多个卖出条件，也只会在最终的卖出计划中出现一次。
+    sell_plan_copy = select * from sell_plan_copy context by 股票代码 limit 1
+    
+    // 返回最终整理好的卖出计划表。
+    return sell_plan_copy
+}
+
+
+
+
+
+
+// 均线策略卖出计划函数
+def sell_plan_function_ma_strategy(
+    account_everyday_copy,
+    mutable sell_plan_copy, 
+    trading_day){
+    
+    // 1. 初始化临时卖出计划表结构
+    sell_plan_temporary = table(1:0, 
+        `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+        [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE]
+    )
+    
+    // 2. 策略1：持仓满5日的卖出计划（时间全部止损）
+    sell_plan_from_account_1 = select 日期, 股票代码, 股票名称, `持仓满5日 as 交易策略, 5 as 计划持仓天数,`计划卖出 as 交易类别, 市价 as 计划成交单价,持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金from account_everyday_copy where 理论持仓剩余天数<=0  // 持仓已满5天
+    
+    // 3. 策略2：盈利超过80%的卖出计划（指标全部止盈）
+    sell_plan_from_account_2 = select 日期, 股票代码, 股票名称, `高于成本百分之80 as 交易策略, 5 as 计划持仓天数, `计划卖出 as 交易类别, 市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额,成本价, 0.001*市值 as 手续费, 0 as 税金 from account_everyday_copy where 盈亏比例>=0.80  // 盈利≥80%
+    
+    // 4. 策略3：盈利超过40%的卖出计划（平仓一半）
+    sell_plan_from_account_3 = select 日期, 股票代码, 股票名称, `高于成本百分之40 as 交易策略,5 as 计划持仓天数,`计划卖出 as 交易类别,市价 as 计划成交单价, int(持仓股数 * 0.5) as 成交股数,  as 计划成交额, 成本价,0.001*市值*0.5 as 手续费,0 as 税金 from account_everyday_copy  where 盈亏比例>=0.40 and 盈亏比例<0.80  // 盈利40%-80%
+    
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_1)
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_2)
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_3)
+    
+    // 5. 策略4：亏损超过10%的卖出计划（止损）
+    sell_plan_from_account_1 = select 
+        日期, 股票代码, 股票名称, 
+        `低于成本百分之10 as 交易策略,
+        5 as 计划持仓天数,
+        `计划卖出 as 交易类别,
+        市价 as 计划成交单价,
+        持仓股数 as 成交股数,
+        (市值-0.001*市值) as 计划成交额,
+        成本价,
+        0.001*市值 as 手续费,
+        0 as 税金
+    from account_everyday_copy 
+    where 盈亏比例<=-0.10  // 亏损≥10%
+    
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_1)
+    
+    // 6. 合并历史卖出计划与当日新生成的计划
+    sell_plan_copy = unionAll(sell_plan_temporary, sell_plan_copy)
+    
+    // 7. 去重处理：每个股票只保留最先触发的卖出信号
+    // 按触发优先级排序：止损 > 止盈80% > 止盈40% > 时间止损
+    sell_plan_copy = select * from sell_plan_copy context by 股票代码 csort 交易策略 limit 1
+    
+    // 8. 返回更新后的卖出计划表
+    return sell_plan_copy
+}
+
+// 部分卖出计划功能函数
+def sell_plan_function_portfolio_2(
+    account_everyday_copy,   
+    mutable sell_plan_copy,    
+    portfolio_change_copy){
+    
+    /*
+    account_everyday_copy,       // 参数1: 每日持仓账户数据表，包含各股票的持仓信息、成本、市值等
+    mutable sell_plan_copy,      // 参数2: 可修改的卖出计划表，用于累积多日的卖出计划（虽然此处未修改，但保留mutable特性）
+    portfolio_change_copy        // 参数3: 投资组合调仓比例（DOUBLE类型），表示调仓后希望保留的仓位比例
+    */
+
+    // 1. 计算需要卖出的比例
+    // 如果portfolio_change_copy=0.8，表示希望保留80%仓位，则需要卖出剩余20%仓位
+    sell_portfolio_change_copy = 1 - portfolio_change_copy
+    
+    // 2. 筛选出尚未被其他卖出策略标记的股票
+    // 通过左连接（left join）将持仓账户表与已有卖出计划表关联
+    // where b.股票代码 = NULL 条件筛选出在卖出计划表中没有匹配记录的股票
+    // 这确保了比例调仓不会与止盈止损等策略冲突
+    account_everyday_except_sell_left = select * from account_everyday_copy as a 
+    left join sell_plan_copy as b on a.股票代码 = b.股票代码 
+    where b.股票代码 = NULL
+    
+    // 3. 生成基于投资组合调仓的卖出计划
+    // 对筛选出的每只股票，按相同比例计算卖出细节
+    trading_portfolio_change = select 
+        日期,                           // 交易日期
+        股票代码,                        // 股票唯一标识
+        股票名称,                        // 股票中文名称
+        `比例调仓位 as 交易策略,          // 卖出原因：比例调仓
+        20 as 计划持仓天数,               // 预设的持仓周期（与之前策略保持一致）
+        `计划卖出 as 交易类别,            // 交易方向：计划卖出
+        市价 as 计划成交单价,             // 当前市价作为计划卖出价格
+        
+        // 成交股数计算：确保是100股的整数倍
+        // floor(持仓股数 * 卖出比例 / 100) * 100
+        // 先除以100取整，再乘以100，确保结果是100的倍数
+        // 例如：持仓1500股，卖出比例20% → 1500*0.2=300 → floor(300/100)=3 → 3*100=300股
+        floor(持仓股数*sell_portfolio_change_copy/100)*100 as 成交股数,
+        
+        floor(持仓股数*sell_portfolio_change_copy/100)*100*市价 as 计划成交额,   // 计划成交额计算：成交股数 × 市价
+        成本价,                                                                 // 买入成本价
+        
+        // 手续费计算：卖出市值的0.1% × 卖出比例 // 市值 = 持仓股数 × 市价，卖出部分的手续费按比例计算
+        0.001*市值*sell_portfolio_change_copy as 手续费,    
+                            
+        0 as 税金                                                              // 税金（A股卖出无税）
+    
+    from account_everyday_except_sell_left
+    
+    // 4. 返回生成的投资组合调仓卖出计划表
+    return trading_portfolio_change
+}
+
+
+// 实际比例卖出函数
+def sell_actual_function_portfolio_2(
+    mutable sell_plan_copy,
+    sell_plan_portfolio_copy,
+    trading_day,
+    mutable account_everyday_copy  ){
+    
+    /*
+    mutable sell_plan_copy,          // 参数1: 可修改的常规卖出计划表（止盈止损等策略生成）
+    sell_plan_portfolio_copy,        // 参数2: 投资组合比例调仓卖出计划表（不可修改）
+    trading_day,                     // 参数3: 当前交易日（DATE类型），用于获取当日行情数据
+    mutable account_everyday_copy    // 参数4: 可修改的每日持仓账户数据表
+    */
+    
+    // 1. 加载当日行情数据（不复权收盘价）
+    // 从分布式数据库"dfs://基础数据表_表1_不复权"加载当日数据
+    // 使用日期分区列`日期进行高效查询 
+    trading_day_table_1 = select * from loadTable("dfs://基础数据表_表1_不复权", `日期) 
+    where date == trading_day  // 只取当前交易日的行情数据
+    
+    // --- 步骤1：更新账户持仓数据（基于当日收盘价） ---
+    
+    // 1.1 更新正常交易股票的持仓数据
+    // 通过左连接将持仓表与当日行情表关联，筛选出有当日行情数据的股票
+    account_everyday_open = select 
+        date as 日期,                               // 使用行情数据的日期
+        股票代码, 
+        股票名称, 
+        持仓股数, 
+        成本价,
+        close as 市价,                               // 当日收盘价作为最新市价
+        持仓成本,                                    // 原始持仓成本（不变）
+        close*持仓股数-持仓成本*0.0015 as 市值,       // 市值计算：收盘价×持仓股数 - 持仓成本×0.15%（扣除买入手续费）
+        round(((close*持仓股数-持仓成本*0.0015)-持仓成本)/持仓成本, 4) as 盈亏比例,        // 盈亏比例计算：(市值-持仓成本)/持仓成本，保留4位小数
+        round((close*持仓股数-持仓成本*0.0015)-持仓成本, 2) as 浮动盈亏,                  // 浮动盈亏计算：市值-持仓成本，保留2位小数
+        持仓策略, 
+        买入日期,
+        理论持仓剩余天数-1 as 理论持仓剩余天数         // 持仓天数减1：距离20天持仓期满又近了一天
+    from account_everyday_copy as a 
+    left join trading_day_table_1 as b on a.股票代码 = b.ts_code 
+    where b.ts_code != NULL  // 只保留有当日行情数据的股票
+    
+    // 1.2 处理停牌等无行情数据的股票
+    // 这些股票保持原值，只更新日期和减少持仓天数
+    account_everyday_not_open = select 
+        trading_day as 日期,            // 使用传入的交易日期
+        股票代码, 股票名称, 持仓股数, 成本价, 市价, 持仓成本, 市值, 
+        盈亏比例, 浮动盈亏, 持仓策略, 买入日期,
+        理论持仓剩余天数-1 as 理论持仓剩余天数  // 持仓天数同样减1
+    from account_everyday_copy a 
+    left join trading_day_table_1 as b on a.股票代码 = b.ts_code 
+    where b.ts_code = NULL  // 只保留没有当日行情数据的股票
+    
+    // --- 步骤2：执行常规卖出计划（止盈止损等策略） ---
+    
+    // 2.1 生成实际卖出记录
+    // 将卖出计划转化为实际交易记录，计算实际成交金额、盈亏等
+    sell_actual_copy = select 
+        日期, 
+        股票代码, 
+        股票名称, 
+        交易策略, 
+        计划持仓天数,
+        `卖出 as 交易类别,                // 将"计划卖出"改为"卖出"
+        计划成交单价,                     // 原计划卖出价格
+        市价 as 实际成交单价,             // 实际成交价格（当日收盘价）
+        成交股数, 
+        计划成交额,
+        round(市价*成交股数*0.999, 2) as 实际成交额,                                 // 实际成交额：市价×成交股数×0.999（扣除0.1%手续费）
+        成本价,
+        round(round(市价*成交股数*0.999, 2)-持仓成本, 2) as 盈亏,                    // 实际盈亏：实际成交额 - 持仓成本
+        round((round(市价*成交股数*0.999, 2)-持仓成本)/持仓成本, 4) as 盈亏比例,      // 实际盈亏比例：(实际成交额-持仓成本)/持仓成本
+        round((市价*成交股数*0.001),2) as 手续费,                                   // 手续费：市价×成交股数×0.1%
+        税金 as 税金                                                               // 保持原税金值
+    from account_everyday_open as a 
+    left join sell_plan_copy as b on a.股票代码 = b.股票代码 
+    where b.股票代码 != NULL  // 只保留有卖出计划的股票
+    
+    // 2.2 更新持仓表：移除已全部卖出的股票
+    // 筛选出没有卖出计划的股票（即未卖出的持仓）
+    account_everyday_after_sold = select 
+        日期, 股票代码, 股票名称, 持仓股数, 成本价, 市价, 
+        持仓成本, 市值, 盈亏比例, 浮动盈亏, 持仓策略, 买入日期, 理论持仓剩余天数
+    from account_everyday_open as a 
+    left join sell_actual_copy as b on a.股票代码 = b.股票代码 
+    where b.股票代码 == NULL  // 只保留没有实际卖出记录的股票
+    
+    // --- 步骤3：执行投资组合调仓卖出计划 ---
+    
+    // 3.1 生成比例调仓的实际卖出记录
+    // 处理投资组合整体调仓的卖出计划
+    sell_actual_portfolio_copy = select 
+        日期, 股票代码, 股票名称, 交易策略, 计划持仓天数,
+        `卖出 as 交易类别,                // 同样改为"卖出"
+        计划成交单价,
+        市价 as 实际成交单价,
+        成交股数, 计划成交额,
+        round(市价*成交股数*0.999, 2) as 实际成交额,
+        成本价,
+        round(round(市价*成交股数*0.999, 2)-持仓成本, 2) as 盈亏,
+        round((round(市价*成交股数*0.999, 2)-持仓成本)/持仓成本, 4) as 盈亏比例,
+        round((市价*成交股数*0.001),2) as 手续费,
+        税金 as 税金
+    from account_everyday_after_sold as a 
+    left join sell_plan_portfolio_copy as b on a.股票代码 = b.股票代码 
+    where b.股票代码 != NULL  // 只保留有调仓卖出计划的股票
+    
+    // 3.2 更新部分卖出的股票持仓（比例调仓只卖出部分仓位）
+    account_everyday_after_portfolio_sold = select 
+        日期, 
+        股票代码, 
+        股票名称,
+        (持仓股数 - 成交股数) as 持仓股数,      // 扣除卖出部分
+        成本价, 
+        市价,
+        (持仓股数 - 成交股数)*成本价 as 持仓成本,                                        // 重新计算持仓成本
+        (市价*(持仓股数 - 成交股数)-(持仓股数 - 成交股数)*成本价*0.0015) as 市值,         // 重新计算市值：剩余股数×市价 - 剩余持仓成本×0.15%
+        
+        // 重新计算盈亏比例：(市值-含手续费的持仓成本)/持仓成本
+        round((市价*(持仓股数 - 成交股数)-(持仓股数 - 成交股数)*成本价*1.0015)/((持仓股数 - 成交股数)*成本价), 4) as 盈亏比例,
+        
+        // 重新计算浮动盈亏：市值-含手续费的持仓成本
+        round((市价*(持仓股数 - 成交股数)-(持仓股数 - 成交股数)*成本价*1.0015),2) as 浮动盈亏,
+        
+        持仓策略, 
+        买入日期, 
+        理论持仓剩余天数
+    from account_everyday_after_sold as a 
+    left join sell_plan_portfolio_copy as b on a.股票代码 = b.股票代码 
+    where b.股票代码 != NULL  // 只保留有调仓卖出计划的股票
+    
+    // 3.3 保留未参与调仓卖出的股票
+    account_everyday_after_portfolio_sold_left = select 
+        日期, 
+        股票代码, 
+        股票名称, 
+        持仓股数, 
+        成本价, 
+        市价, 
+        持仓成本, 
+        市值, 
+        盈亏比例, 
+        浮动盈亏, 
+        持仓策略, 
+        买入日期, 
+        理论持仓剩余天数
+    from account_everyday_after_sold as a 
+    left join sell_plan_portfolio_copy as b on a.股票代码 = b.股票代码 
+    where b.股票代码 == NULL  // 只保留没有调仓卖出计划的股票
+    
+    // --- 步骤4：整合结果并返回 ---
+    
+    // 4.1 合并所有实际卖出记录
+    sell_actual_copy = unionAll(sell_actual_copy, sell_actual_portfolio_copy)
+    
+    // 4.2 清理已执行的卖出计划
+    // 从原卖出计划表中移除已生成实际交易记录的计划
+    sell_plan_copy = select 
+        日期, 
+        股票代码, 
+        股票名称, 
+        交易策略, 
+        计划持仓天数, 
+        交易类别,
+        计划成交单价, 
+        成交股数, 
+        计划成交额, 
+        成本价, 
+        手续费, 
+        税金
+    from sell_plan_copy as a 
+    left join sell_actual_copy as b on a.股票代码 = b.股票代码 
+    where b.股票代码 == NULL  // 只保留没有实际卖出记录的计划
+    
+    // 4.3 合并更新后的账户持仓数据
+    // 先合并部分卖出和未卖出的股票
+    account_everyday_copy = unionAll(account_everyday_after_portfolio_sold, account_everyday_after_portfolio_sold_left)
+    // 再合并停牌等未开盘的股票
+    account_everyday_copy = unionAll(account_everyday_copy, account_everyday_not_open)
+    
+    // 4.4 返回三张关键表
+    // [实际交易记录, 更新后的账户持仓, 待执行的卖出计划]
+    return [sell_actual_copy, account_everyday_copy, sell_plan_copy]
+}
+
+
+
+///////////////////////////基础信息输入///////////////////////////
+
+trading_days = getMarketCalendar("XSHG", 2017.04.01, 2040.05.10)
+beginDate = 2017.01.01
+endDate = 2024.12.29
+db = database("dfs://表2_前复权_因子指标")
+table_2 = db.loadTable("日期")
+trading_day_data_2 = select * from loadTable("dfs://表2_前复权_因子指标", `日期)
+unique_values = distinct(trading_day_data_2.date)
+trading_day = reverse(unique_values)
+
+beginDate_index = first(at(trading_day==beginDate))
+endDate_index = first(at(trading_day==endDate))
+trading_day_1 = trading_day[beginDate_index:endDate_index]
+
+
+cash_funding = 10000000 //账户现金
+market_capitalization = 0  //实际仓位
+portfolio_minimum_cash=0  // 可用的现金
+i = 0 //交易的第i天
+dfs_factor_score = "dfs://表4_触发底指标数据"  // 每支股票技术指标的地址
+each_stock_cost_price = 50000  //每支股票最多花5万
+
+///////////////////////////数据库与表格仓库存储///////////////////////////
+account_everyday = table(1:0, `日期`股票代码`股票名称`持仓股数`成本价`市价`持仓成本`市值`盈亏比例`浮动盈亏`持仓策略`买入日期`理论持仓剩余天数, 
+[DATE, SYMBOL, SYMBOL, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, SYMBOL, DATE, INT])
+sell_plan = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+sell_plan_portfolio = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+buy_plan = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+sell_actual = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+buy_actual = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+sell_and_buy_plan_detailed = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+sell_and_buy_actual_detailed = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+account_detailed = table(1:0, `日期`股票代码`股票名称`持仓股数`成本价`市价`持仓成本`市值`盈亏比例`浮动盈亏`持仓策略`买入日期`理论持仓剩余天数, 
+[DATE, SYMBOL, SYMBOL, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, SYMBOL, DATE, INT])
+cash_position_summary = table(1:0,`日期`期初资金`可用资金`持仓市值`总权益`累计盈亏`浮动盈亏`实际仓位`理论仓位比`理论仓位趋势`理论仓位抄底,
+[DATE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, INT, DOUBLE])
+// timer(1) 40s
+
+
+
+
+
+///////////////////////////主运行函数///////////////////////////
+
+// 遍历交易日列表，对每一天执行回测
+// 这是一个历史回测的主循环，模拟策略在历史数据上的每日运行过程
+
+for(i in 0:trading_day_1.size()){  // i从0到交易日列表长度-1，遍历每个交易日
+    // 1. 执行当日实际交易
+    // 调用函数处理卖出和买入计划，并返回当天的实际交易记录和更新后的账户数据
+    sell_buy_actual_sell_plan_account_everyday = sell_buy_actual_function(
+        account_everyday_copy=account_everyday,              // 参数1: 当前账户持仓数据表
+        sell_plan_copy=sell_plan,                            // 参数2: 当前卖出计划表
+        buy_plan_copy=buy_plan,                              // 参数3: 当前买入计划表
+        trading_day=trading_day_1[i],                        // 参数4: 当前交易日（DATE类型）
+        portfolio_minimum_cash_copy=portfolio_minimum_cash,  // 参数5: 账户最低现金要求
+        each_stock_cost_price_copy=each_stock_cost_price     // 参数6: 每只股票的固定成本预算
+    )
+    
+    // 从函数返回的列表中提取数据
+    sell_actual = sell_buy_actual_sell_plan_account_everyday[0]  // 实际卖出记录表
+    sell_cash = exec sum(实际成交额) from sell_actual             // 计算卖出回笼的资金
+    if (sell_cash==null){ // 如果当天没有卖出，回笼资金为0
+        sell_cash=0
+    }
+    
+    buy_actual = sell_buy_actual_sell_plan_account_everyday[1]   // 实际买入记录表
+    buy_cash = exec sum(实际成交额) from buy_actual               // 计算买入花费的资金
+    if (buy_cash==null){ // 如果当天没有买入，花费资金为0
+        buy_cash=0
+    }
+    
+    // 更新账户总可用现金
+    // 现金 = 原现金 + 卖出回笼资金 - 买入花费资金
+    cash_funding = round(cash_funding + sell_cash - buy_cash,2)
+    
+    // 更新卖出计划和账户持仓，`sell_plan` 移除了已执行的计划，`account_everyday` 更新了持仓股数
+    sell_plan = sell_buy_actual_sell_plan_account_everyday[2]               // 更新后的卖出计划表（已移除已执行计划）
+    account_everyday = sell_buy_actual_sell_plan_account_everyday[3]        // 更新后的账户持仓表
+    
+    // 清空买入计划表，为下一轮循环生成新计划做准备
+    // 创建空表结构，准备接收新的买入计划
+    buy_plan = table(1:0, 
+        `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+        [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE]
+    )
+
+    // 2. 记录每日数据快照
+    // 将更新后的账户持仓追加到历史明细表中
+    account_detailed.append!(account_everyday)  // 记录每日持仓明细
+    // 将当天的卖出和买入记录追加到交易明细表中
+    sell_and_buy_actual_detailed.append!(sell_actual)  // 记录卖出交易明细
+    sell_and_buy_actual_detailed.append!(buy_actual)   // 记录买入交易明细
+        
+    // 创建当天的资金和仓位快照，用于绩效分析
+    cash_position_everyday = table(
+        take(trading_day_1[i],1) as 日期,                                               // 当前交易日
+        10000000 as 期初资金,                                                           // 初始资金1000万
+        cash_funding as 可用资金,                                                       // 当前可用现金
+        round((exec sum(市值) from account_everyday),2) as 持仓市值,                    // 持仓总市值
+        round(((exec sum(市值) from account_everyday) + cash_funding),2) as 总权益,     // 总资产 = 持仓市值 + 现金
+        round((exec sum(盈亏) from sell_and_buy_actual_detailed),2) as 累计盈亏,        // 累计实现盈亏
+        round((exec sum(浮动盈亏) from account_everyday),2) as 浮动盈亏,                // 当前持仓浮动盈亏
+        round((exec sum(市值) from account_everyday)/((exec sum(市值) from account_everyday) + cash_funding),2) as 实际仓位,  // 实际仓位比例
+        // 从外部数据源加载理论仓位指标
+        first(exec 仓位总和 from loadTable("dfs://表3_底指标统计仓位", `日期) where date == trading_day_1[i]) as 理论仓位比,
+        first(exec 理论仓位趋势 from loadTable("dfs://表3_底指标统计仓位", `日期) where date == trading_day_1[i]) as 理论仓位趋势,
+        first(exec 理论仓位抄底 from loadTable("dfs://表3_底指标统计仓位", `日期) where date == trading_day_1[i]) as 理论仓位抄底
+    )
+    // 将当天的快照追加到资金汇总历史表中
+    cash_position_summary.append!(cash_position_everyday)
+
+    // 3. 生成下一交易日计划（卖出或买入）
+    // 从外部数据源获取今天的理论仓位
+    today_portfolio = first(exec 仓位总和 from loadTable("dfs://表3_底指标统计仓位", `日期) where date == trading_day_1[i])
+    if (today_portfolio>=1){ // 理论仓位上限为100%
+        today_portfolio=1
+    }
+    
+    // 计算当前持仓总市值
+    market_capitalization = exec sum(市值) from account_everyday
+    if (market_capitalization==null){ // 如果没有持仓，市值为0
+        market_capitalization=0
+    }
+    
+    // 根据理论仓位计算所需的最低现金，若该值为负，则表示需要卖出
+    // 公式：最低现金 = (现金+市值)×理论仓位 - 市值
+    // 如果结果为负，说明当前仓位高于理论仓位，需要卖出
+    portfolio_minimum_cash = (cash_funding + market_capitalization)*today_portfolio - market_capitalization
+    
+    // 如果需要卖出（最低现金为负或0）
+    if (portfolio_minimum_cash<=0){
+        // 生成常规卖出计划（止盈止损等）
+        sell_plan = sell_plan_function_1(
+            account_everyday_copy=account_everyday,  // 当前账户持仓
+            sell_plan_copy=sell_plan,                // 当前卖出计划
+            trading_day=trading_day_1[i]             // 当前交易日
+        )
+        
+        // 获取昨天的理论仓位，用于判断是否需要调仓
+        yestoday_portfolio = first(exec 仓位总和 from loadTable("dfs://表3_底指标统计仓位", `日期) where date == trading_day_1[i-1])
+        if (yestoday_portfolio>=1){
+            yestoday_portfolio=1
+        }
+        
+        portfolio_change = today_portfolio/yestoday_portfolio // 计算调仓比例
+        
+        // 如果今天的理论仓位比昨天低，则需要调仓卖出
+        if (portfolio_change<1){                       
+            sell_plan_portfolio = sell_plan_function_portfolio_2(
+                account_everyday_copy=account_everyday,                 // 当前账户持仓
+                sell_plan_copy=sell_plan,                               // 常规卖出计划
+                portfolio_change_copy=portfolio_change                  // 调仓比例
+            )
+            sell_plan = unionAll(sell_plan, sell_plan_portfolio)        // 合并常规和调仓卖出计划
+            sell_and_buy_plan_detailed.append!(sell_plan)               // 记录卖出计划明细
+            continue // 结束本轮循环，进入下一天（因为只需要卖出，不需要买入）
+        }
+        else{ // 仓位不降低，只执行常规卖出
+            sell_and_buy_plan_detailed.append!(sell_plan)               // 记录卖出计划明细
+            continue // 结束本轮循环，进入下一天
+        } 
+    }
+    else{ // 如果有资金可以买入 则生成卖出和买入计划
+
+        sell_buy_plan = sell_buy_plan_function(
+            portfolio_minimum_cash_copy=portfolio_minimum_cash,         // 可用资金（正数表示可买入）
+            trading_day=trading_day_1[i],                               // 当前交易日
+            account_everyday_copy=account_everyday,                     // 当前账户持仓
+            sell_plan_copy=sell_plan,                                   // 当前卖出计划
+            each_stock_cost_price=each_stock_cost_price,                // 每只股票成本预算
+            factor_parameters_copy=factor_parameters_1                  // 因子参数配置
+        )
+        sell_plan = sell_buy_plan[0]                    // 获取卖出计划
+        buy_plan = sell_buy_plan[1]                     // 获取买入计划
+        sell_and_buy_plan_detailed.append!(sell_plan)   // 记录卖出计划明细
+        sell_and_buy_plan_detailed.append!(buy_plan)    // 记录买入计划明细
+    }
+    print(trading_day_1[i])  // 打印当前处理日期，用于进度跟踪
+}
+
+
+
+
+
