@@ -1,0 +1,523 @@
+
+///////////////////////////登录与初始化///////////////////////////
+login("admin", "123456")
+trading_days = getMarketCalendar("XSHG", 2017.04.01, 2040.05.10)
+
+///////////////////////////自定义函数创建///////////////////////////
+@jit
+def stockcount_points(MA55HL, D1, D2, D3, D4, djiu, dKDJ) {
+    firstpoints = 0
+    secondpoint = 0
+    countpints = 0
+    totalpoints = 0
+
+    // 头分计算 - 修复了重复计算D3的问题
+    firstpoints = 
+        iif(string(D1) == "Y", 0.05, 0) + 
+        iif(string(D2) == "Y", 0.24, 
+            iif(string(D3) == "Y", 0.28, 0)) + 
+        iif(D4 == 1, 0.32, 0) + 
+        iif(string(dKDJ) == "Y", 0.10, 0) + 
+        iif(MA55HL == 1, 1.00, 0) + 
+        iif(djiu == 7, 0.06, 
+            iif(djiu == 8, 0.08, 
+                iif(djiu == 9, 0.10, 0)))
+    
+    // 二分计数
+    countpints = 
+        iif(string(D1) == "Y", 1, 0) + 
+        iif(string(D2) == "Y" || string(D3) == "Y", 1, 0) + 
+        iif(D4 == 1, 1, 0) + 
+        iif(string(dKDJ) == "Y", 1, 0) + 
+        iif(djiu >= 7 && djiu <= 9, 1, 0)
+    
+    // 二分赋分
+    secondpoint = 
+        iif(countpints == 2, 0.1, 
+            iif(countpints == 3, 0.20, 
+                iif(countpints == 4, 0.30, 
+                    iif(countpints == 5, 0.40, 0))))
+    
+    // 总分合并
+    totalpoints = secondpoint + firstpoints 
+    return [totalpoints, firstpoints, secondpoint]
+}
+go
+
+@jit
+def evaluate_Factor_table_2_optimized(trading_day_table_2_copy, factor_params){
+    n = trading_day_table_2_copy.size()
+    
+    // 使用向量化操作替代矩阵操作
+    D1_scores = array(DOUBLE, n, 0)
+    D4_scores = array(DOUBLE, n, 0)
+    low9_scores = array(DOUBLE, n, 0)
+    D2_D3_scores = array(DOUBLE, n, 0)
+    L_KDJ_scores = array(DOUBLE, n, 0)
+    
+    // 并行计算各因子得分
+    D1_scores[trading_day_table_2_copy.D1 == "Y"] = factor_params['L_D1_score']
+    D4_scores[trading_day_table_2_copy.D4 == "Y"] = factor_params['L_D4_score']
+    
+    // 低9得分计算优化
+    low9_val = trading_day_table_2_copy.低9
+    low9_scores[low9_val == 8] = factor_params['L_TD_D8_score']
+    low9_scores[low9_val == 9] = factor_params['L_TD_D9_score']
+    low9_scores[low9_val >= 10] = factor_params['L_TD_D10_score']
+    
+    // D2和D3得分计算优化
+    D2_flag = trading_day_table_2_copy.D2 == "Y"
+    D3_flag = trading_day_table_2_copy.D3 == "Y"
+    D2_D3_scores[D2_flag && D3_flag] = factor_params['L_D3_score']
+    D2_D3_scores[!D2_flag && D3_flag] = factor_params['L_D3_score']
+    D2_D3_scores[D2_flag && !D3_flag] = factor_params['L_D2_score']
+    
+    L_KDJ_scores[trading_day_table_2_copy.底kdj == "Y"] = factor_params['L_KDJ_score']
+    
+    // 计算因子数量
+    factor_matrix = matrix(D1_scores, D4_scores, low9_scores, D2_D3_scores, L_KDJ_scores)
+    factor_number = 5 - each(rowSum, factor_matrix == 0)
+    
+    // 计算联动得分
+    factor_Comovement_scores = array(DOUBLE, n, 0)
+    factor_Comovement_scores[factor_number == 2] = factor_params['factor_Comovement_2_scores']
+    factor_Comovement_scores[factor_number == 3] = factor_params['factor_Comovement_3_scores']
+    factor_Comovement_scores[factor_number == 4] = factor_params['factor_Comovement_4_scores']
+    factor_Comovement_scores[factor_number == 5] = factor_params['factor_Comovement_5_scores']
+    
+    // 计算总分
+    抄底赋值 = D1_scores + D4_scores + low9_scores + D2_D3_scores + L_KDJ_scores
+    趋势赋值 = array(DOUBLE, n, 0)
+    趋势赋值[trading_day_table_2_copy.MA55HL == 1] = factor_params['MA55HL_score']
+    
+    赋值总和 = 抄底赋值 + 趋势赋值 + factor_Comovement_scores
+    
+    // 更新原表
+    trading_day_table_2_copy[`赋值总和] = 赋值总和
+    trading_day_table_2_copy[`趋势赋值] = 趋势赋值
+    trading_day_table_2_copy[`抄底赋值] = 抄底赋值
+    
+    return trading_day_table_2_copy
+}
+
+///////////////////////////基础信息输入///////////////////////////
+beginDate = 2017.01.01
+endDate = 2024.12.29
+
+// 获取交易日列表 - 修复索引计算错误
+trading_day_data_2 = select * from loadTable("dfs://表2_前复权_因子指标", `日期)
+unique_values = distinct(trading_day_data_2.date)
+trading_day = reverse(unique_values)
+
+// 修复边界处理：使用>=和<=而不是==
+beginDate_index = first(at(trading_day>=beginDate))
+endDate_index = first(at(trading_day<=endDate))
+trading_day_1 = trading_day[beginDate_index:endDate_index]
+
+// 因子参数配置
+factor_parameters_1 = {
+    'L_TD_D8_score': 0.06,
+    'L_TD_D9_score': 0.08,
+    'L_TD_D10_score': 0.1,
+    'L_KDJ_score': 0.12,
+    'L_D1_score': 0.05,
+    'L_D2_score': 0.24,
+    'L_D3_score': 0.28,
+    'L_D4_score': 0.32,
+    'MA55HL_score': 1,
+    'factor_Comovement_2_scores': 0.1,
+    'factor_Comovement_3_scores': 0.2,
+    'factor_Comovement_4_scores': 0.3,
+    'factor_Comovement_5_scores': 0.4
+}
+
+// 资金管理变量 - 修复循环依赖
+available_cash = 10000000  // 可用现金
+total_equity = 10000000    // 总权益 = 可用现金 + 持仓市值
+each_stock_cost_price = 50000  // 每支股票最多花5万
+
+///////////////////////////数据库与表格仓库存储///////////////////////////
+// 简化的表结构定义
+account_everyday = table(1:0, `日期`股票代码`股票名称`持仓股数`成本价`市价`持仓成本`市值`盈亏比例`浮动盈亏`持仓策略`买入日期`理论持仓剩余天数, 
+[DATE, SYMBOL, SYMBOL, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, SYMBOL, DATE, INT])
+
+sell_plan = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+
+buy_plan = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+
+sell_actual = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+
+buy_actual = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+[DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+
+account_detailed = table(1:0, `日期`股票代码`股票名称`持仓股数`成本价`市价`持仓成本`市值`盈亏比例`浮动盈亏`持仓策略`买入日期`理论持仓剩余天数, 
+[DATE, SYMBOL, SYMBOL, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, SYMBOL, DATE, INT])
+
+cash_position_summary = table(1:0, `日期`期初资金`可用资金`持仓市值`总权益`累计盈亏`浮动盈亏`实际仓位`理论仓位比`理论仓位趋势`理论仓位抄底,
+[DATE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, INT, DOUBLE])
+
+///////////////////////////核心交易函数///////////////////////////
+def generate_sell_plan(account_everyday_copy, trading_day){
+    sell_plan_temporary = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+      [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+    
+    // 策略1：持仓满20日
+    sell_plan_temporary.append!(
+        select 日期, 股票代码, 股票名称, `持仓满20日 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+        市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 
+        from account_everyday_copy where 理论持仓剩余天数<=0
+    )
+    
+    // 策略2：止盈55%
+    sell_plan_temporary.append!(
+        select 日期, 股票代码, 股票名称, `高于成本百分之55 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+        市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 
+        from account_everyday_copy where 盈亏比例>=0.55
+    )
+    
+    // 策略3：止损20%
+    sell_plan_temporary.append!(
+        select 日期, 股票代码, 股票名称, `低于成本百分之20 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+        市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 
+        from account_everyday_copy where 盈亏比例<=-0.2
+    )
+    
+    // 加载当日因子数据
+    trading_day_table_2 = select * from loadTable("dfs://表2_前复权_因子指标", `日期) where date == trading_day
+    
+    // 连接持仓与因子数据
+    alignedTable = select * from account_everyday_copy as a 
+        left join trading_day_table_2 as b on a.股票代码 = b.ts_code 
+        where b.ts_code != NULL
+    
+    // 策略4：触发高9
+    sell_plan_temporary.append!(
+        select 日期, 股票代码, 股票名称, `触发高9 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+        市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 
+        from alignedTable where 高9>=9
+    )
+    
+    // 策略5：跌破MA55L
+    sell_plan_temporary.append!(
+        select 日期, 股票代码, 股票名称, `收盘价低于当日MA55L值 as 交易策略, 20 as 计划持仓天数, `计划卖出 as 交易类别,
+        市价 as 计划成交单价, 持仓股数 as 成交股数, (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金 
+        from alignedTable where 市价<MA55L
+    )
+    
+    // 去重：每只股票只保留一个卖出计划
+    return select * from sell_plan_temporary context by 股票代码 limit 1
+}
+
+def generate_buy_plan(available_cash_amount, trading_day, account_everyday_copy, each_stock_cost){
+    // 计算可买入股票数量
+    buy_stock_number = floor(available_cash_amount / each_stock_cost)
+    
+    if(buy_stock_number <= 0){
+        return table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+          [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+    }
+    
+    // 加载当日因子数据并评分
+    trading_day_table_2 = select * from loadTable("dfs://表2_前复权_因子指标", `日期) where date == trading_day
+    trading_day_table_factor_score = evaluate_Factor_table_2_optimized(
+        trading_day_table_2_copy=trading_day_table_2, 
+        factor_params=factor_parameters_1
+    )
+    
+    // 筛选得分最高的股票
+    trading_day_table_buy = select date, ts_code, 赋值总和, 趋势赋值, 抄底赋值 
+        from trading_day_table_factor_score 
+        where 赋值总和 >= 1
+        order by 赋值总和 desc 
+        limit buy_stock_number
+    
+    // 排除已持仓股票
+    trading_day_table_buy = select date, ts_code, 赋值总和, 趋势赋值, 抄底赋值 
+        from trading_day_table_buy as a 
+        left join account_everyday_copy as b on a.ts_code = b.股票代码 
+        where b.股票代码 == NULL
+    
+    // 加载基础数据生成买入计划
+    trading_day_table_1 = select * from loadTable("dfs://基础数据表_表1_不复权", `日期) where date == trading_day
+    
+    buy_plan_copy = select date as 日期, ts_code as 股票代码, ts_name as 股票名称,
+        iif(趋势赋值==1, `趋势, `抄底) as 交易策略,
+        20 as 计划持仓天数, `计划买入 as 交易类别,
+        close as 计划成交单价,
+        floor(each_stock_cost/close/100)*100 as 成交股数,
+        round(floor(each_stock_cost/close/100)*100*close*0.9985, 2) as 计划成交额,
+        close as 成本价,
+        round(floor(each_stock_cost/close/100)*100*close*0.001, 2) as 手续费,
+        round(floor(each_stock_cost/close/100)*100*close*0.0005, 2) as 税金
+        from trading_day_table_buy as a
+        left join trading_day_table_1 as b on a.ts_code = b.ts_code
+        where b.ts_code != NULL
+    
+    return buy_plan_copy
+}
+
+def execute_trades(account_everyday_copy, sell_plan_copy, buy_plan_copy, trading_day){
+    // 加载当日基础数据
+    trading_day_table_1 = select * from loadTable("dfs://基础数据表_表1_不复权", `日期) where date == trading_day
+    
+    // --- 更新持仓数据 ---
+    account_everyday_open = select date as 日期, 股票代码, 股票名称, 持仓股数, 成本价, close as 市价, 持仓成本, 
+        round(close*持仓股数-持仓成本*0.0015, 2) as 市值,
+        round((close*持仓股数-持仓成本*1.0015)/持仓成本, 4) as 盈亏比例,
+        round(close*持仓股数-持仓成本*1.0015, 2) as 浮动盈亏,
+        持仓策略, 买入日期, 理论持仓剩余天数-1 as 理论持仓剩余天数
+        from account_everyday_copy as a 
+        left join trading_day_table_1 as b on a.股票代码 = b.ts_code 
+        where b.ts_code != NULL
+    
+    // 处理未开盘股票
+    account_everyday_not_open = select trading_day as 日期, 股票代码, 股票名称, 持仓股数, 成本价, 市价, 持仓成本, 
+        市值, 盈亏比例, 浮动盈亏, 持仓策略, 买入日期, 理论持仓剩余天数-1 as 理论持仓剩余天数
+        from account_everyday_copy a 
+        left join trading_day_table_1 as b on a.股票代码 = b.ts_code 
+        where b.ts_code == NULL
+    
+    // --- 执行卖出计划 ---
+    sell_actual_copy = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+        [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+    
+    // 执行卖出计划
+    if(sell_plan_copy.size() > 0){
+        sell_actual_copy = select 日期, 股票代码, 股票名称, 交易策略, 计划持仓天数, `卖出 as 交易类别,
+            计划成交单价, 市价 as 实际成交单价, 成交股数, 计划成交额,
+            round(市价*成交股数*0.999, 2) as 实际成交额, 成本价,
+            round(round(市价*成交股数*0.999, 2)-持仓成本, 2) as 盈亏,
+            round((round(市价*成交股数*0.999, 2)-持仓成本)/持仓成本, 4) as 盈亏比例,
+            round(市价*成交股数*0.001, 2) as 手续费, 税金
+            from account_everyday_open as a 
+            left join sell_plan_copy as b on a.股票代码 = b.股票代码 
+            where b.股票代码 != NULL
+    }
+    
+    // 更新卖出后的持仓
+    account_everyday_after_sold = select 日期, 股票代码, 股票名称, 持仓股数, 成本价, 市价, 持仓成本, 市值, 
+        盈亏比例, 浮动盈亏, 持仓策略, 买入日期, 理论持仓剩余天数
+        from account_everyday_open as a 
+        left join sell_actual_copy as b on a.股票代码 = b.股票代码 
+        where b.股票代码 == NULL
+    
+    // --- 执行买入计划 ---
+    buy_actual_copy = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+        [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+    
+    // 执行买入计划
+    if(buy_plan_copy.size() > 0){
+        buy_actual_copy = select date as 日期, 股票代码, 股票名称, 交易策略, 计划持仓天数, `买入 as 交易类别,
+            计划成交单价, close as 实际成交单价, 成交股数, 计划成交额,
+            round(close*成交股数, 2) as 实际成交额, close as 成本价,
+            -close*成交股数*0.0015 as 盈亏, -0.0015 as 盈亏比例,
+            round(close*成交股数*0.001, 2) as 手续费, 税金
+            from buy_plan_copy as a 
+            left join trading_day_table_1 as b on a.股票代码 = b.ts_code 
+            where b.ts_code != NULL
+    }
+    
+    // 更新买入后的持仓
+    account_everyday_buy_actual = select 日期, 股票代码, 股票名称, 成交股数 as 持仓股数, 实际成交单价 as 成本价, 
+        实际成交单价 as 市价, round(实际成交额, 2) as 持仓成本,
+        round(实际成交额*0.9985, 2) as 市值, -0.0015 as 盈亏比例,
+        round(-实际成交额*0.0015, 2) as 浮动盈亏, 交易策略 as 持仓策略,
+        日期 as 买入日期, 20 as 理论持仓剩余天数
+        from buy_actual_copy
+    
+    // 合并所有持仓
+    account_everyday_copy = unionAll(account_everyday_after_sold, account_everyday_not_open)
+    account_everyday_copy = unionAll(account_everyday_copy, account_everyday_buy_actual)
+    
+    // 更新卖出计划（移除已执行的）
+    if(sell_plan_copy.size() > 0){
+        sell_plan_copy = select 日期, 股票代码, 股票名称, 交易策略, 计划持仓天数, 交易类别, 
+            计划成交单价, 成交股数, 计划成交额, 成本价, 手续费, 税金
+            from sell_plan_copy as a 
+            left join sell_actual_copy as b on a.股票代码 = b.股票代码 
+            where b.股票代码 == NULL
+    }
+    
+    return [sell_actual_copy, buy_actual_copy, sell_plan_copy, account_everyday_copy]
+}
+
+///////////////////////////主运行函数（优化版）///////////////////////////
+// 预先缓存数据以提高性能
+portfolio_data = select date, 仓位总和, 理论仓位趋势, 理论仓位抄底 
+    from loadTable("dfs://表3_底指标统计仓位", `日期) 
+    where date between beginDate : endDate
+portfolio_dict = dict(portfolio_data.date, portfolio_data.仓位总和)
+portfolio_trend_dict = dict(portfolio_data.date, portfolio_data.理论仓位趋势)
+portfolio_bottom_dict = dict(portfolio_data.date, portfolio_data.理论仓位抄底)
+
+// 主回测循环
+for(i in 0:trading_day_1.size()-1){
+    current_date = trading_day_1[i]
+    print("处理交易日: " + string(current_date))
+    
+    // 1. 执行当日交易
+    trade_result = execute_trades(
+        account_everyday_copy=account_everyday,
+        sell_plan_copy=sell_plan,
+        buy_plan_copy=buy_plan,
+        trading_day=current_date
+    )
+    
+    // 提取交易结果
+    sell_actual = trade_result[0]
+    buy_actual = trade_result[1]
+    sell_plan = trade_result[2]
+    account_everyday = trade_result[3]
+    
+    // 2. 更新资金
+    sell_cash = exec sum(实际成交额) from sell_actual
+    if (sell_cash==null) sell_cash=0
+    
+    buy_cash = exec sum(实际成交额) from buy_actual
+    if (buy_cash==null) buy_cash=0
+    
+    available_cash = round(available_cash + sell_cash - buy_cash, 2)
+    
+    // 3. 记录交易明细
+    account_detailed.append!(account_everyday)
+    if(sell_actual.size() > 0) sell_and_buy_actual_detailed.append!(sell_actual)
+    if(buy_actual.size() > 0) sell_and_buy_actual_detailed.append!(buy_actual)
+    
+    // 4. 计算当日绩效
+    market_capitalization = exec sum(市值) from account_everyday
+    if (market_capitalization==null) market_capitalization=0
+    
+    total_equity = available_cash + market_capitalization
+    
+    // 从缓存获取仓位数据
+    today_portfolio = portfolio_dict[current_date]
+    if(isNull(today_portfolio)) today_portfolio = 0
+    if (today_portfolio>=1) today_portfolio=1
+    
+    today_trend = portfolio_trend_dict[current_date]
+    if(isNull(today_trend)) today_trend = 0
+    
+    today_bottom = portfolio_bottom_dict[current_date]
+    if(isNull(today_bottom)) today_bottom = 0
+    
+    // 创建资金快照
+    cash_position_everyday = table(
+        take(current_date, 1) as 日期,
+        10000000 as 期初资金,
+        available_cash as 可用资金,
+        round(market_capitalization, 2) as 持仓市值,
+        round(total_equity, 2) as 总权益,
+        round(exec sum(盈亏) from sell_and_buy_actual_detailed, 2) as 累计盈亏,
+        round(exec sum(浮动盈亏) from account_everyday, 2) as 浮动盈亏,
+        round(market_capitalization/total_equity, 2) as 实际仓位,
+        today_portfolio as 理论仓位比,
+        today_trend as 理论仓位趋势,
+        today_bottom as 理论仓位抄底
+    )
+    cash_position_summary.append!(cash_position_everyday)
+    
+    // 5. 生成下一交易日计划
+    // 计算目标持仓市值
+    target_position_value = total_equity * today_portfolio
+    position_gap = target_position_value - market_capitalization
+    
+    // 清空买入计划
+    buy_plan = table(1:0, `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+        [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+    
+    if (position_gap < 0){
+        // 需要卖出
+        // 生成常规卖出计划
+        sell_plan = generate_sell_plan(account_everyday_copy=account_everyday, trading_day=current_date)
+        
+        // 检查是否需要调仓卖出
+        if(i > 0){
+            prev_date = trading_day_1[i-1]
+            yestoday_portfolio = portfolio_dict[prev_date]
+            if(isNull(yestoday_portfolio)) yestoday_portfolio = 0
+            if (yestoday_portfolio>=1) yestoday_portfolio=1
+            
+            if(yestoday_portfolio != 0){
+                portfolio_change = today_portfolio / yestoday_portfolio
+                if(portfolio_change < 1){
+                    // 生成调仓卖出计划
+                    sell_portfolio_change = 1 - portfolio_change
+                    account_everyday_except_sell_left = select * from account_everyday as a 
+                        left join sell_plan as b on a.股票代码 = b.股票代码 
+                        where b.股票代码 == NULL
+                    
+                    sell_plan_portfolio = select 日期, 股票代码, 股票名称, `比例调仓位 as 交易策略, 
+                        20 as 计划持仓天数, `计划卖出 as 交易类别,
+                        市价 as 计划成交单价, 
+                        floor(持仓股数*sell_portfolio_change/100)*100 as 成交股数,
+                        floor(持仓股数*sell_portfolio_change/100)*100*市价 as 计划成交额,
+                        成本价, 0.001*市值*sell_portfolio_change as 手续费, 0 as 税金
+                        from account_everyday_except_sell_left
+                    
+                    sell_plan = unionAll(sell_plan, sell_plan_portfolio)
+                }
+            }
+        }
+        
+        // 记录卖出计划
+        sell_and_buy_plan_detailed.append!(sell_plan)
+    }
+    else{
+        // 可以买入
+        // 生成卖出计划（如果有需要卖出的股票）
+        sell_plan = generate_sell_plan(account_everyday_copy=account_everyday, trading_day=current_date)
+        
+        // 生成买入计划
+        if(position_gap > 0){
+            buy_plan = generate_buy_plan(
+                available_cash_amount=position_gap,
+                trading_day=current_date,
+                account_everyday_copy=account_everyday,
+                each_stock_cost=each_stock_cost_price
+            )
+        }
+        
+        // 记录交易计划
+        if(sell_plan.size() > 0) sell_and_buy_plan_detailed.append!(sell_plan)
+        if(buy_plan.size() > 0) sell_and_buy_plan_detailed.append!(buy_plan)
+    }
+}
+
+///////////////////////////数据入库///////////////////////////
+// 创建资金汇总表
+if(existsDatabase("dfs://4_资金汇总表")) dropDatabase("dfs://4_资金汇总表")
+mdb = database("dfs://4_资金汇总表", VALUE, trading_days)
+zijinhuizong = createPartitionedTable(dbHandle=mdb, table=cash_position_summary, tableName=`日期, partitionColumns=`日期)
+tableInsert(zijinhuizong, cash_position_summary)
+
+// 创建持仓明细表
+if(existsDatabase("dfs://3_持仓明细表")) dropDatabase("dfs://3_持仓明细表")
+mdb = database("dfs://3_持仓明细表", VALUE, trading_days)
+chicangmingxi = createPartitionedTable(dbHandle=mdb, table=account_detailed, tableName=`日期, partitionColumns=`日期)
+tableInsert(chicangmingxi, account_detailed)
+
+// 创建交易明细表
+if(existsDatabase("dfs://2_交易明细表")) dropDatabase("dfs://2_交易明细表")
+mdb = database("dfs://2_交易明细表", VALUE, trading_days)
+jiaoyimingxi = createPartitionedTable(dbHandle=mdb, table=sell_and_buy_actual_detailed, tableName=`日期, partitionColumns=`日期)
+tableInsert(jiaoyimingxi, sell_and_buy_actual_detailed)
+
+// 创建信号交易计划表
+if(existsDatabase("dfs://1_信号交易计划表")) dropDatabase("dfs://1_信号交易计划表")
+mdb = database("dfs://1_信号交易计划表", VALUE, trading_days)
+xinhaojiaoyijihua = createPartitionedTable(dbHandle=mdb, table=sell_and_buy_plan_detailed, tableName=`日期, partitionColumns=`日期)
+tableInsert(xinhaojiaoyijihua, sell_and_buy_plan_detailed)
+
+///////////////////////////结果导出///////////////////////////
+// 导出资金汇总表到CSV
+saveText(cash_position_summary, "D:/PycharmProjects/交易导出数据/资金汇总表.csv")
+
+// 打印最终结果
+print("回测完成！")
+print("最终可用现金: " + string(available_cash))
+print("最终持仓市值: " + string(exec sum(市值) from account_everyday))
+print("总权益: " + string(available_cash + exec sum(市值) from account_everyday))
+print("累计盈亏: " + string(exec sum(盈亏) from sell_and_buy_actual_detailed))
