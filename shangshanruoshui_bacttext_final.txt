@@ -438,10 +438,9 @@ for(i in 0:trading_day_1.size()){
 
     print(trading_day_1[i])
 }
+go
 
-
-// 18年初-25年中 timer(1) 1 min 42 s
-
+// 18年初-25年中 timer(1) 1 min 54 s
 
 
 if(existsDatabase("dfs://4_资金汇总表")) dropDatabase("dfs://4_资金汇总表")
