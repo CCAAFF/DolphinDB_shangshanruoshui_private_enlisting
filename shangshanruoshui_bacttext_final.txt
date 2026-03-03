@@ -21,6 +21,74 @@
 出手：持仓满5个交易日 → 全部平仓
 */
 
+//// 代码逻辑详解
+/*
+每日行情数据（表2_前复权_因子指标2）
+        │
+        ▼
+evaluate_Factor_table_2
+  ├── 条件1：ma5 > ma20 > ma60（均线多头）     → signal_ma_long
+  ├── 条件2：close_qfq > ma20（站上均线）      → signal_above_ma20
+  ├── 条件3：距离ma20 ≤ 10%（回踩不远）        → signal_within_10pct
+  ├── 条件4：close_qfq > open_qfq（收阳线）   → signal_bull_bar
+  └── 条件5：成交量 > ma_v_20（量能放大）      → signal_vol_ok
+        │
+        │ buy_signal = 1024（五个条件全满足）
+        ▼
+      买入候选股票池
+        │
+        ▼
+sell_buy_plan_function（每日生成计划）
+        │
+        ├─── 卖出计划生成 ───────────────────────────────────────┐
+        │                                                        │
+        │    持仓表 account_everyday                             │
+        │           │                                           │
+        │           ▼                                           │
+        │    sell_plan_function_1                               │
+        │      ├── 持仓满5日      → 全仓卖出                    │
+        │      ├── 盈亏比例≥80%   → 全仓卖出                    │
+        │      └── 盈亏比例≤-10%  → 全仓卖出                    │
+        │           │ 输出：sell_plan（全仓卖出计划）             │
+        │           ▼                                           │
+        │    sell_plan_function_portfolio_2                     │
+        │      └── 40% ≤ 盈亏比例 < 80% → 卖出一半             │
+        │           │ 输出：sell_plan_ratio（半仓卖出计划）       │
+        │           ▼                                           │
+        │    unionAll 合并两个卖出计划                           │
+        │                                                        │
+        └─── 买入计划生成 ───────────────────────────────────────┘
+                    │
+                    │ 可用资金 = cash_funding
+                    │ 可买数量 = floor(可用资金 / each_stock_cost_price)
+                    ▼
+             买入候选池（buy_signal == 1024）
+              └── 排除已持仓股票
+                    │ 输出：buy_plan（买入计划）
+                    ▼
+        返回 [sell_plan, sell_plan_ratio, buy_plan]
+                    │
+                    ▼
+        sell_buy_actual_function（次日执行）
+          ├── 步骤1：按收盘价更新持仓市值、盈亏比例
+          ├── 步骤2：执行卖出计划
+          │     ├── 全仓卖出 → 持仓股数归零，从持仓表剔除
+          │     └── 半仓卖出 → 持仓股数减半，继续保留
+          ├── 步骤3：执行买入计划
+          │     └── 按收盘价成交，写入持仓，理论持仓天数=5
+          └── 步骤4：返回 [sell_actual, buy_actual, sell_plan, account_everyday]
+                    │
+                    ▼
+        ┌───────────────────────────────┐
+        │      每日数据归档              │
+        ├── account_detailed            │  持仓明细
+        ├── sell_and_buy_actual_detailed│  实际交易记录
+        ├── sell_and_buy_plan_detailed  │  计划记录
+        └── cash_position_summary       │  资金与仓位快照
+        └───────────────────────────────┘
+*/
+
+
 
 ///////////////////////////登录与初始化///////////////////////////
 login("admin", "123456")
