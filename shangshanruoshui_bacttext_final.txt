@@ -532,7 +532,7 @@ xinhaojiaoyijihua = createPartitionedTable(dbHandle=mdb, table=sell_and_buy_plan
 tableInsert(xinhaojiaoyijihua, sell_and_buy_plan_detailed)
 
 // 数据保存
-saveText(cash_position_summary, "D:/DolphinDB_data/交易导出数据/资金汇总表——上善若水张经理案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
-saveText(account_detailed, "D:/DolphinDB_data/交易导出数据/账户详情表——上善若水张经理案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
-saveText(sell_and_buy_actual_detailed, "D:/DolphinDB_data/交易导出数据/买卖实操表——上善若水张经理案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
-saveText(sell_and_buy_plan_detailed, "D:/DolphinDB_data/交易导出数据/买卖计划表——上善若水张经理案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
+saveText(cash_position_summary, "D:/DolphinDB_data/交易导出数据/资金汇总表——上善若水张总案例v.csv", delimiter=',', append=false, header=true, bom="UTF-8")
+saveText(account_detailed, "D:/DolphinDB_data/交易导出数据/账户详情表——上善若水张总案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
+saveText(sell_and_buy_actual_detailed, "D:/DolphinDB_data/交易导出数据/买卖实操表——上善若水张总案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
+saveText(sell_and_buy_plan_detailed, "D:/DolphinDB_data/交易导出数据/买卖计划表——上善若水张总案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
