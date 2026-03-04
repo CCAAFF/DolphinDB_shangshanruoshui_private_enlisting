@@ -12,7 +12,7 @@
 不超过10%：距离不超过10%
 收阳线：收盘价 close > 开盘价 open
 成交量确认（优化项）：当日成交量 vol 大于20日均量 ma_v_20
-
+5
 
 卖出规则（持仓期内）：
 止盈1：涨幅 ≥ 40% → 平仓一半
@@ -185,12 +185,12 @@ def sell_plan_function_1(account_everyday_copy, mutable sell_plan_copy, trading_
         from account_everyday_copy where 盈亏比例 >= 0.80
     sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_1)
 
-    //// 止损模块：亏损 >= 10% 全仓卖出
+    //// 止损模块：亏损 >= 5% 全仓卖出
     sell_plan_from_account_1 = select 日期, 股票代码, 股票名称,
-        `低于成本百分之10 as 交易策略, 5 as 计划持仓天数, `计划卖出 as 交易类别,
+        `低于成本百分之5 as 交易策略, 5 as 计划持仓天数, `计划卖出 as 交易类别,
         市价 as 计划成交单价, 持仓股数 as 成交股数,
         (市值-0.001*市值) as 计划成交额, 成本价, 0.001*市值 as 手续费, 0 as 税金
-        from account_everyday_copy where 盈亏比例 <= -0.1
+        from account_everyday_copy where 盈亏比例 <= -0.05
     sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_1)
 
     // 合并去重：同一只股票触发多个条件，只保留第一条（优先级按上面追加顺序）
@@ -510,7 +510,7 @@ go
 
 // 18年初-25年中 timer(1) 1 min 54 s
 
-
+/*
 if(existsDatabase("dfs://4_资金汇总表")) dropDatabase("dfs://4_资金汇总表")
 mdb = database("dfs://4_资金汇总表", VALUE, trading_days)
 zijinhuizong = createPartitionedTable(dbHandle=mdb, table=cash_position_summary, tableName=`日期, partitionColumns=`日期)
@@ -532,7 +532,40 @@ xinhaojiaoyijihua = createPartitionedTable(dbHandle=mdb, table=sell_and_buy_plan
 tableInsert(xinhaojiaoyijihua, sell_and_buy_plan_detailed)
 
 // 数据保存
-saveText(cash_position_summary, "D:/DolphinDB_data/交易导出数据/资金汇总表——上善若水张总案例v.csv", delimiter=',', append=false, header=true, bom="UTF-8")
+saveText(cash_position_summary, "D:/DolphinDB_data/交易导出数据/资金汇总表——上善若水张总案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
 saveText(account_detailed, "D:/DolphinDB_data/交易导出数据/账户详情表——上善若水张总案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
 saveText(sell_and_buy_actual_detailed, "D:/DolphinDB_data/交易导出数据/买卖实操表——上善若水张总案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
 saveText(sell_and_buy_plan_detailed, "D:/DolphinDB_data/交易导出数据/买卖计划表——上善若水张总案例.csv", delimiter=',', append=false, header=true, bom="UTF-8")
+*/
+
+// 读取资金汇总表
+t = select * from loadTable("dfs://4_资金汇总表", `日期)
+// 或者直接用内存里的表
+// t = cash_position_summary
+
+// ── 图1：总权益走势 vs 期初资金 ──────────────────────────────────
+plot(
+    [t.总权益, t.期初资金],
+    t.日期,
+    title="总权益走势",
+    extras={xlabel:"日期", ylabel:"金额（元）"},
+    chartType=LINE
+)
+
+// ── 图2：累计盈亏 ────────────────────────────────────────────────
+plot(
+    t.累计盈亏,
+    t.日期,
+    title="累计盈亏走势",
+    extras={xlabel:"日期", ylabel:"盈亏（元）"},
+    chartType=LINE
+)
+
+// ── 图3：可用资金 + 持仓市值 ─────────────────────────────────────
+plot(
+    [t.可用资金, t.持仓市值],
+    t.日期,
+    title="资金结构（现金+持仓）",
+    extras={xlabel:"日期", ylabel:"金额（元）"},
+    chartType=LINE
+)
