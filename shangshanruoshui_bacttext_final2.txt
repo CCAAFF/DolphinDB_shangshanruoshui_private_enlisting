@@ -1,0 +1,528 @@
+//// 逻辑思考（第二次版本）
+// 改动点：
+// 1. 去掉「持仓满5天强制卖出」
+// 2. 每只股票最高仓位 5%（单票市值 ≤ 总权益的 5%）
+// 3. 手续费改为万1（0.0001），印花税仍 0.0005
+// 4. 新增卖出条件：收盘价连续两天跌破20日均线也卖出
+
+///////////////////////////登录与初始化///////////////////////////
+login("admin", "123456")
+
+///////////////////////////自定义函数创建///////////////////////////
+
+def evaluate_Factor_table_2(mutable trading_day_table_2_copy){
+
+    // 1. 均线多头排列：ma5 > ma20 > ma60
+    trading_day_table_2_copy[`cond_ma5_gt_ma20] =
+        iif(trading_day_table_2_copy.ma5  > trading_day_table_2_copy.ma20, 1, 0)
+    trading_day_table_2_copy[`cond_ma20_gt_ma60] =
+        iif(trading_day_table_2_copy.ma20 > trading_day_table_2_copy.ma60, 1, 0)
+    trading_day_table_2_copy[`signal_ma_long] =
+        trading_day_table_2_copy.cond_ma5_gt_ma20 * trading_day_table_2_copy.cond_ma20_gt_ma60
+
+    // 2. 收盘价在 ma20 之上
+    trading_day_table_2_copy[`signal_above_ma20] =
+        iif(trading_day_table_2_copy.close_qfq > trading_day_table_2_copy.ma20, 2, 0)
+
+    // 3. 距离 ma20 不超过 10%
+    trading_day_table_2_copy[`cond_ma20_pos] =
+        iif(trading_day_table_2_copy.ma20 > 0, 1, 0)
+    trading_day_table_2_copy[`cond_within_10pct] =
+        iif((trading_day_table_2_copy.close_qfq - trading_day_table_2_copy.ma20) / trading_day_table_2_copy.ma20 <= 0.10, 4, 0)
+    trading_day_table_2_copy[`signal_within_10pct] =
+        trading_day_table_2_copy.cond_ma20_pos * trading_day_table_2_copy.cond_within_10pct
+
+    // 4. 收阳线
+    trading_day_table_2_copy[`signal_bull_bar] =
+        iif(trading_day_table_2_copy.close_qfq > trading_day_table_2_copy.open_qfq, 8, 0)
+
+    // 5. 成交量确认：当日成交量 > 20日均量
+    trading_day_table_2_copy[`signal_vol_ok] =
+        iif(trading_day_table_2_copy.成交量万手 > trading_day_table_2_copy.ma_v_20, 16, 0)
+
+    // 6. 最终信号：所有子条件相乘（相当于逻辑与）
+    trading_day_table_2_copy[`buy_signal] =
+        trading_day_table_2_copy.signal_ma_long *
+        trading_day_table_2_copy.signal_above_ma20 *
+        trading_day_table_2_copy.signal_within_10pct *
+        trading_day_table_2_copy.signal_bull_bar *
+        trading_day_table_2_copy.signal_vol_ok
+
+    // 7. 总得分 0~31
+    trading_day_table_2_copy[`signal_score] =
+        trading_day_table_2_copy.signal_ma_long +
+        trading_day_table_2_copy.signal_above_ma20 +
+        trading_day_table_2_copy.signal_within_10pct +
+        trading_day_table_2_copy.signal_bull_bar +
+        trading_day_table_2_copy.signal_vol_ok
+
+    return trading_day_table_2_copy
+}
+go
+
+// ── 全仓卖出函数 ──────────────────────────────────────────────────────
+def sell_plan_function_1(account_everyday_copy, mutable sell_plan_copy,
+    trading_day, trading_days_copy){
+
+    sell_plan_temporary = table(1:0,
+        `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+        [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+
+    // 止盈：盈利 >= 80% 全仓卖出
+    sell_plan_from_account_1 = select 日期, 股票代码, 股票名称,
+        `高于成本百分之80 as 交易策略, 0 as 计划持仓天数, `计划卖出 as 交易类别,
+        市价 as 计划成交单价, 持仓股数 as 成交股数,
+        round(市值 * (1 - 0.0001 - 0.0005), 2) as 计划成交额,
+        成本价,
+        round(市值 * 0.0001, 2) as 手续费,
+        round(市值 * 0.0005, 2) as 税金
+        from account_everyday_copy where 盈亏比例 >= 0.80
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_1)
+
+    // 止损：亏损 >= 10% 全仓卖出
+    sell_plan_from_account_1 = select 日期, 股票代码, 股票名称,
+        `低于成本百分之10 as 交易策略, 0 as 计划持仓天数, `计划卖出 as 交易类别,
+        市价 as 计划成交单价, 持仓股数 as 成交股数,
+        round(市值 * (1 - 0.0001 - 0.0005), 2) as 计划成交额,
+        成本价,
+        round(市值 * 0.0001, 2) as 手续费,
+        round(市值 * 0.0005, 2) as 税金
+        from account_everyday_copy where 盈亏比例 <= -0.10
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_account_1)
+
+    // 新增：连续两日收盘价跌破 ma20 → 全仓卖出
+    trading_day_table_2_today = select ts_code, close_qfq, ma20
+        from loadTable("dfs://表2_前复权_因子指标2", `日期)
+        where date == trading_day
+
+    prev_idx = first(at(trading_days_copy == trading_day)) - 1
+    prev_trading_day = trading_days_copy[prev_idx]
+
+    trading_day_table_2_prev = select ts_code, close_qfq as close_qfq_prev, ma20 as ma20_prev
+        from loadTable("dfs://表2_前复权_因子指标2", `日期)
+        where date == prev_trading_day
+
+    two_day_table = select * from trading_day_table_2_today as a
+        left join trading_day_table_2_prev as b on a.ts_code = b.ts_code
+        where b.ts_code != NULL
+
+    below_ma20_2days = select ts_code from two_day_table
+        where close_qfq < ma20 and close_qfq_prev < ma20_prev
+
+    sell_plan_from_ma20 = select 日期, 股票代码, 股票名称,
+        `连续两日跌破MA20 as 交易策略, 0 as 计划持仓天数, `计划卖出 as 交易类别,
+        市价 as 计划成交单价, 持仓股数 as 成交股数,
+        round(市值 * (1 - 0.0001 - 0.0005), 2) as 计划成交额,
+        成本价,
+        round(市值 * 0.0001, 2) as 手续费,
+        round(市值 * 0.0005, 2) as 税金
+        from account_everyday_copy as a
+        inner join below_ma20_2days as b on a.股票代码 = b.ts_code
+    sell_plan_temporary = unionAll(sell_plan_temporary, sell_plan_from_ma20)
+
+    // 合并去重：同一只股票只保留第一条（优先级按追加顺序）
+    sell_plan_copy = unionAll(sell_plan_temporary, sell_plan_copy)
+    sell_plan_copy = select * from sell_plan_copy context by 股票代码 limit 1
+
+    return sell_plan_copy
+}
+go
+
+// ── 半仓卖出函数 ──────────────────────────────────────────────────────
+def sell_plan_function_portfolio_2(account_everyday_copy, mutable sell_plan_copy){
+
+    account_not_in_plan = select * from account_everyday_copy as a
+        left join sell_plan_copy as b on a.股票代码 = b.股票代码
+        where b.股票代码 == NULL
+
+    account_40_80 = select * from account_not_in_plan
+        where 盈亏比例 >= 0.40 and 盈亏比例 < 0.80
+
+    sell_plan_half = select
+        日期, 股票代码, 股票名称,
+        `高于成本百分之40_卖出一半 as 交易策略,
+        0 as 计划持仓天数,
+        `计划卖出 as 交易类别,
+        市价 as 计划成交单价,
+        floor(持仓股数 * 0.5 / 100) * 100 as 成交股数,
+        round(floor(持仓股数 * 0.5 / 100) * 100 * 市价 * (1 - 0.0001 - 0.0005), 2) as 计划成交额,
+        成本价,
+        round(floor(持仓股数 * 0.5 / 100) * 100 * 市价 * 0.0001, 2) as 手续费,
+        round(floor(持仓股数 * 0.5 / 100) * 100 * 市价 * 0.0005, 2) as 税金
+        from account_40_80
+
+    return sell_plan_half
+}
+go
+
+// ── 买入+卖出计划生成函数 ────────────────────────────────────────────
+def sell_buy_plan_function(mutable portfolio_minimum_cash_copy, trading_day,
+    account_everyday_copy, mutable sell_plan_copy, each_stock_cost_price,
+    total_equity_copy, trading_days_copy){
+
+    // ── 卖出计划生成 ──────────────────────────────────────────────────
+    sell_plan_copy = sell_plan_function_1(
+        account_everyday_copy = account_everyday_copy,
+        sell_plan_copy        = sell_plan_copy,
+        trading_day           = trading_day,
+        trading_days_copy     = trading_days_copy
+    )
+
+    sell_plan_ratio_copy = sell_plan_function_portfolio_2(
+        account_everyday_copy = account_everyday_copy,
+        sell_plan_copy        = sell_plan_copy
+    )
+
+    sell_plan_copy = unionAll(sell_plan_copy, sell_plan_ratio_copy)
+
+    // ── 买入计划生成 ──────────────────────────────────────────────────
+    sell_plan_cash = exec sum(计划成交额) from sell_plan_copy
+    if (sell_plan_cash == null){ sell_plan_cash = 0 }
+
+    buy_stock_number = floor((sell_plan_cash + portfolio_minimum_cash_copy) / each_stock_cost_price)
+
+    if(buy_stock_number > 0){
+
+        trading_day_table_2 = select * from loadTable("dfs://表2_前复权_因子指标2", `日期)
+            where date == trading_day
+
+        trading_day_table_factor_score = evaluate_Factor_table_2(
+            trading_day_table_2_copy = trading_day_table_2
+        )
+
+        trading_day_table_buy = select date, ts_code, signal_score, buy_signal
+            from trading_day_table_factor_score
+            where buy_signal == 1024
+            order by signal_score desc
+            limit buy_stock_number
+
+        // 排除已持仓股票
+        trading_day_table_buy = select * from trading_day_table_buy as a
+            left join account_everyday_copy as b on a.ts_code = b.股票代码
+            where b.股票代码 == NULL
+
+        trading_day_table_1 = select * from loadTable("dfs://基础数据表_表1_不复权", `日期)
+            where date == trading_day
+
+        // 每只股票成交额不超过总权益的 5%
+        max_single_position = round(total_equity_copy * 0.05, 2)
+        actual_cost = min(each_stock_cost_price, max_single_position)
+
+        buy_plan_copy = select
+            date as 日期,
+            ts_code as 股票代码,
+            ts_name as 股票名称,
+            `均线回踩买入 as 交易策略,
+            0 as 计划持仓天数,
+            `计划买入 as 交易类别,
+            close as 计划成交单价,
+            floor(actual_cost / close / 100) * 100 as 成交股数,
+            round(floor(actual_cost / close / 100) * 100 * close * (1 - 0.0001), 2) as 计划成交额,
+            close as 成本价,
+            round(floor(actual_cost / close / 100) * 100 * close * 0.0001, 2) as 手续费,
+            0.0 as 税金
+            from trading_day_table_buy as a
+            left join trading_day_table_1 as b on a.ts_code = b.ts_code
+            where b.ts_code != NULL
+    }
+    else{
+        buy_plan_copy = table(1:0,
+            `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+            [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+    }
+
+    return [sell_plan_copy, sell_plan_ratio_copy, buy_plan_copy]
+}
+go
+
+// ── 执行函数 ─────────────────────────────────────────────────────────
+def sell_buy_actual_function(mutable account_everyday_copy, mutable sell_plan_copy,
+    mutable buy_plan_copy, trading_day, portfolio_minimum_cash_copy,
+    each_stock_cost_price_copy, total_equity_copy){
+
+    trading_day_table_1 = select * from loadTable("dfs://基础数据表_表1_不复权", `日期)
+        where date == trading_day
+
+    // 步骤1：按收盘价更新持仓（手续费系数 0.0006 = 万1买入 + 万5印花税）
+    account_everyday_open = select
+        date as 日期, 股票代码, 股票名称, 持仓股数, 成本价,
+        close as 市价, 持仓成本,
+        round((close * 持仓股数 - 持仓成本 * 0.0006), 2) as 市值,
+        round((close * 持仓股数 - 持仓成本 * 1.0006) / 持仓成本, 4) as 盈亏比例,
+        round((close * 持仓股数 - 持仓成本 * 1.0006), 2) as 浮动盈亏,
+        持仓策略, 买入日期,
+        理论持仓剩余天数 - 1 as 理论持仓剩余天数
+        from account_everyday_copy as a
+        left join trading_day_table_1 as b on a.股票代码 = b.ts_code
+        where b.ts_code != NULL
+
+    account_everyday_not_open = select
+        trading_day as 日期, 股票代码, 股票名称, 持仓股数, 成本价,
+        市价, 持仓成本, 市值, 盈亏比例, 浮动盈亏, 持仓策略, 买入日期,
+        理论持仓剩余天数 - 1 as 理论持仓剩余天数
+        from account_everyday_copy as a
+        left join trading_day_table_1 as b on a.股票代码 = b.ts_code
+        where b.ts_code == NULL
+
+    // 步骤2：执行卖出计划（万1手续费 + 万5印花税）
+    sell_actual_copy = select
+        日期, 股票代码, 股票名称, 交易策略, 计划持仓天数, `卖出 as 交易类别,
+        计划成交单价, 市价 as 实际成交单价, 成交股数, 计划成交额,
+        round(市价 * 成交股数 * (1 - 0.0001 - 0.0005), 2) as 实际成交额,
+        成本价,
+        round(市价 * 成交股数 * (1 - 0.0001 - 0.0005) - 持仓成本, 2) as 盈亏,
+        round((市价 * 成交股数 * (1 - 0.0001 - 0.0005) - 持仓成本) / 持仓成本, 4) as 盈亏比例,
+        round(市价 * 成交股数 * 0.0001, 2) as 手续费,
+        round(市价 * 成交股数 * 0.0005, 2) as 税金
+        from account_everyday_open as a
+        left join sell_plan_copy as b on a.股票代码 = b.股票代码
+        where b.股票代码 != NULL
+
+    // 半仓/全仓卖出后持仓更新
+    account_everyday_after_do_sold = select
+        日期, 股票代码, 股票名称,
+        (持仓股数 - 成交股数) as 持仓股数,
+        成本价, 市价,
+        (持仓股数 - 成交股数) * 成本价 as 持仓成本,
+        round(市价 * (持仓股数 - 成交股数) - (持仓股数 - 成交股数) * 成本价 * 0.0006, 2) as 市值,
+        round((市价 * (持仓股数 - 成交股数) - (持仓股数 - 成交股数) * 成本价 * 1.0006)
+            / ((持仓股数 - 成交股数) * 成本价), 4) as 盈亏比例,
+        round(市价 * (持仓股数 - 成交股数) - (持仓股数 - 成交股数) * 成本价 * 1.0006, 2) as 浮动盈亏,
+        持仓策略, 买入日期, 理论持仓剩余天数
+        from account_everyday_open as a
+        left join sell_plan_copy as b on a.股票代码 = b.股票代码
+        where b.股票代码 != NULL
+
+    // 全仓卖出（持仓股数归零）的行剔除
+    account_everyday_after_do_sold = select * from account_everyday_after_do_sold
+        where 持仓股数 != 0
+
+    account_everyday_open_but_not_sold = select
+        日期, 股票代码, 股票名称, 持仓股数, 成本价, 市价, 持仓成本,
+        市值, 盈亏比例, 浮动盈亏, 持仓策略, 买入日期, 理论持仓剩余天数
+        from account_everyday_open as a
+        left join sell_plan_copy as b on a.股票代码 = b.股票代码
+        where b.股票代码 == NULL
+
+    acount_everyday_copy = unionAll(account_everyday_after_do_sold, account_everyday_open_but_not_sold)
+    acount_everyday_copy = unionAll(acount_everyday_copy, account_everyday_not_open)
+
+    sell_plan_copy = select 日期,股票代码,股票名称,交易策略,计划持仓天数,交易类别,
+        计划成交单价,成交股数,计划成交额,成本价,手续费,税金
+        from sell_plan_copy as a
+        left join sell_actual_copy as b on a.股票代码 = b.股票代码
+        where b.股票代码 == NULL
+    // 步骤3：计算可用资金
+    sold_cash = round(exec sum(实际成交额) from sell_actual_copy, 2)
+    if (sold_cash == null){ sold_cash = 0 }
+
+    // ── 修复：不直接修改传入参数，用新局部变量接收 ──
+    available_cash = portfolio_minimum_cash_copy + sold_cash
+
+    // 5% 仓位上限
+    max_single_position = round(total_equity_copy * 0.05, 2)
+    actual_cost = min(each_stock_cost_price_copy, max_single_position)
+
+    if(available_cash < 0){
+        buy_actual_copy = select
+            date as 日期, 股票代码, 股票名称, 交易策略, 计划持仓天数, 交易类别,
+            计划成交单价, close as 实际成交单价, 成交股数, 计划成交额,
+            round(close * 成交股数, 2) as 实际成交额,
+            close as 成本价,
+            -close * 成交股数 * 0.0001 as 盈亏,
+            -0.0001 as 盈亏比例,
+            round(close * 成交股数 * 0.0001, 2) as 手续费,
+            0.0 as 税金
+            from buy_plan_copy as a
+            left join trading_day_table_1 as b on a.股票代码 = b.ts_code
+            where b.ts_code != NULL
+    }
+    else{
+        can_buy_stock_numbers  = floor(available_cash / actual_cost)
+        plan_buy_stock_numbers = exec count(*) from buy_plan_copy
+
+        if(can_buy_stock_numbers < plan_buy_stock_numbers){
+            buy_plan_copy = select * from buy_plan_copy limit can_buy_stock_numbers
+        }
+
+        buy_actual_copy = select
+            date as 日期, 股票代码, 股票名称, 交易策略, 计划持仓天数, 交易类别,
+            计划成交单价, close as 实际成交单价, 成交股数, 计划成交额,
+            round(close * 成交股数, 2) as 实际成交额,
+            成本价,
+            0 as 盈亏,
+            0 as 盈亏比例,
+            round(close * 成交股数 * 0.0001, 2) as 手续费,
+            0.0 as 税金
+            from buy_plan_copy as a
+            left join trading_day_table_1 as b on a.股票代码 = b.ts_code
+            where b.ts_code != NULL
+    }
+
+
+    // 步骤4：更新持仓表，写入新买入股票
+    acount_everyday_buy_actual = select
+        日期, 股票代码, 股票名称,
+        成交股数 as 持仓股数,
+        实际成交单价 as 成本价,
+        实际成交单价 as 市价,
+        round(实际成交额, 2) as 持仓成本,
+        round(实际成交额 * (1 - 0.0006), 2) as 市值,
+        -0.0006 as 盈亏比例,
+        round(-实际成交额 * 0.0006, 2) as 浮动盈亏,
+        交易策略 as 持仓策略,
+        日期 as 买入日期,
+        0 as 理论持仓剩余天数
+        from buy_actual_copy
+
+    acount_everyday_copy = unionAll(acount_everyday_copy, acount_everyday_buy_actual)
+
+    return [sell_actual_copy, buy_actual_copy, sell_plan_copy, acount_everyday_copy]
+}
+go
+
+///////////////////////////基础信息输入///////////////////////////
+trading_days = getMarketCalendar("XSHG", 2018.04.01, 2040.05.10)
+beginDate = 2018.03.01
+endDate   = 2025.12.29
+
+trading_day_data_2 = select * from loadTable("dfs://表2_前复权_因子指标2", `日期)
+trading_day = sort(distinct(trading_day_data_2.date))
+
+beginDate_index = first(at(trading_day == beginDate))
+endDate_index   = first(at(trading_day == endDate))
+trading_day_1   = trading_day[beginDate_index:endDate_index]
+
+cash_funding           = 10000000  // 账户初始现金
+market_capitalization  = 0
+portfolio_minimum_cash = 0
+total_equity           = 10000000  // 总权益，用于5%仓位计算
+each_stock_cost_price  = 50000     // 单票预算上限（受5%仓位约束）
+
+///////////////////////////数据库与表格仓库存储///////////////////////////
+account_everyday = table(1:0,
+    `日期`股票代码`股票名称`持仓股数`成本价`市价`持仓成本`市值`盈亏比例`浮动盈亏`持仓策略`买入日期`理论持仓剩余天数,
+    [DATE, SYMBOL, SYMBOL, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, SYMBOL, DATE, INT])
+sell_plan = table(1:0,
+    `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+    [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+sell_plan_ratio = table(1:0,
+    `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+    [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+buy_plan = table(1:0,
+    `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+    [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+sell_actual = table(1:0,
+    `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+    [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+buy_actual = table(1:0,
+    `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+    [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+sell_and_buy_plan_detailed = table(1:0,
+    `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+    [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+sell_and_buy_actual_detailed = table(1:0,
+    `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`实际成交单价`成交股数`计划成交额`实际成交额`成本价`盈亏`盈亏比例`手续费`税金,
+    [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+account_detailed = table(1:0,
+    `日期`股票代码`股票名称`持仓股数`成本价`市价`持仓成本`市值`盈亏比例`浮动盈亏`持仓策略`买入日期`理论持仓剩余天数,
+    [DATE, SYMBOL, SYMBOL, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, SYMBOL, DATE, INT])
+cash_position_summary = table(1:0,
+    `日期`期初资金`可用资金`持仓市值`总权益`累计盈亏`浮动盈亏`实际仓位,
+    [DATE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+go
+
+///////////////////////////主运行函数///////////////////////////
+for(i in 0:trading_day_1.size()){
+
+    // ── 1. 执行当日实际交易 ──────────────────────────────────────────
+    sell_buy_result = sell_buy_actual_function(
+        account_everyday_copy       = account_everyday,
+        sell_plan_copy              = sell_plan,
+        buy_plan_copy               = buy_plan,
+        trading_day                 = trading_day_1[i],
+        portfolio_minimum_cash_copy = portfolio_minimum_cash,
+        each_stock_cost_price_copy  = each_stock_cost_price,
+        total_equity_copy           = total_equity
+    )
+
+    sell_actual      = sell_buy_result[0]
+    buy_actual       = sell_buy_result[1]
+    sell_plan        = sell_buy_result[2]
+    account_everyday = sell_buy_result[3]
+
+    sell_cash = exec sum(实际成交额) from sell_actual
+    if (sell_cash == null){ sell_cash = 0 }
+    buy_cash  = exec sum(实际成交额) from buy_actual
+    if (buy_cash == null){ buy_cash = 0 }
+
+    cash_funding = round(cash_funding + sell_cash - buy_cash, 2)
+
+    // 清空买入计划
+    buy_plan = table(1:0,
+        `日期`股票代码`股票名称`交易策略`计划持仓天数`交易类别`计划成交单价`成交股数`计划成交额`成本价`手续费`税金,
+        [DATE, SYMBOL, SYMBOL, SYMBOL, INT, SYMBOL, DOUBLE, INT, DOUBLE, DOUBLE, DOUBLE, DOUBLE])
+
+
+    // ── 2. 记录每日数据快照 ──────────────────────────────────────────
+    account_detailed.append!(account_everyday)
+    sell_and_buy_actual_detailed.append!(sell_actual)
+    sell_and_buy_actual_detailed.append!(buy_actual)
+
+    market_capitalization = exec sum(市值) from account_everyday
+    if (market_capitalization == null){ market_capitalization = 0 }
+
+    // 更新总权益（用于下一日5%仓位计算）
+    total_equity = round(cash_funding + market_capitalization, 2)
+
+    cash_position_everyday = table(
+        take(trading_day_1[i], 1) as 日期,
+        10000000 as 期初资金,
+        cash_funding as 可用资金,
+        round(market_capitalization, 2) as 持仓市值,
+        total_equity as 总权益,
+        round((exec sum(盈亏) from sell_and_buy_actual_detailed), 2) as 累计盈亏,
+        round((exec sum(浮动盈亏) from account_everyday), 2) as 浮动盈亏,
+        round(market_capitalization / total_equity, 2) as 实际仓位
+    )
+    cash_position_summary.append!(cash_position_everyday)
+
+
+    // ── 3. 生成下一交易日计划 ────────────────────────────────────────
+    portfolio_minimum_cash = cash_funding
+
+    sell_buy_plan = sell_buy_plan_function(
+        portfolio_minimum_cash_copy = portfolio_minimum_cash,
+        trading_day                 = trading_day_1[i],
+        account_everyday_copy       = account_everyday,
+        sell_plan_copy              = sell_plan,
+        each_stock_cost_price       = each_stock_cost_price,
+        total_equity_copy           = total_equity,
+        trading_days_copy           = trading_days
+    )
+
+    sell_plan       = sell_buy_plan[0]
+    sell_plan_ratio = sell_buy_plan[1]
+    buy_plan        = sell_buy_plan[2]
+
+    sell_and_buy_plan_detailed.append!(sell_plan)
+    sell_and_buy_plan_detailed.append!(sell_plan_ratio)
+    sell_and_buy_plan_detailed.append!(buy_plan)
+
+    print(trading_day_1[i])
+}
+go
+
+///////////////////////////数据保存///////////////////////////
+saveText(cash_position_summary,
+    "D:/DolphinDB_data/交易导出数据/资金汇总表_第二次版本.csv",
+    delimiter=',', append=false, header=true, bom="UTF-8")
+saveText(account_detailed,
+    "D:/DolphinDB_data/交易导出数据/账户详情表_第二次版本.csv",
+    delimiter=',', append=false, header=true, bom="UTF-8")
+saveText(sell_and_buy_actual_detailed,
+    "D:/DolphinDB_data/交易导出数据/买卖实操表_第二次版本.csv",
+    delimiter=',', append=false, header=true, bom="UTF-8")
+saveText(sell_and_buy_plan_detailed,
+    "D:/DolphinDB_data/交易导出数据/买卖计划表_第二次版本.csv",
+    delimiter=',', append=false, header=true, bom="UTF-8")
